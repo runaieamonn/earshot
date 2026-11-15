@@ -14,12 +14,13 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
 from . import graph as graphmod
 from . import pan as panmod
 from .hush import HushRegistry
+from .safety import safety
 from .protocol import (
     MAX_MSG_BYTES,
     Bye,
@@ -163,6 +164,15 @@ async def ice_servers() -> dict:
     return {"iceServers": servers}
 
 
+@app.get("/healthz")
+async def healthz(request: Request) -> dict:
+    """Loopback-only anonymous RAM telemetry and kill-switch status."""
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=404)
+    return safety.snapshot(active_sessions=len(sessions))
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global next_recompute_at
@@ -173,6 +183,10 @@ async def _startup() -> None:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
+    if safety.pause_reason():
+        await ws.send_text(Error(reason="service_paused").model_dump_json())
+        await ws.close(code=1013)
+        return
     ip = ws.client.host if ws.client else "?"
     if sum(1 for s in sessions.values() if s.ip == ip) >= MAX_SESSIONS_PER_IP:
         await ws.send_text(Error(reason="too many sessions from this address").model_dump_json())
@@ -223,6 +237,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                         continue
                     me.hush_times.append(now)
                     hushes.hush(me.id, tgt)
+                    safety.record_hush()
                 else:
                     hushes.unhush(me.id, tgt)
                 await _broadcast_hushcount(tgt)
