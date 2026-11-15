@@ -146,6 +146,10 @@ async def _broadcast_hushcount(tgt: str) -> None:
             await _send(sessions[sid], msg)
 
 
+_TURN_PLACEHOLDERS = {"", "CHANGE_ME_SHARED_SECRET", "__EARSHOT_TURN_SECRET__", "__GENERATE_WITH_OPENSSL_RAND_HEX_32__"}
+_TURN_DEFAULT_TTL_S = 3600
+
+
 @app.get("/ice")
 async def ice_servers() -> dict:
     """ICE config for clients and bots. TURN creds are coturn's use-auth-secret
@@ -153,9 +157,14 @@ async def ice_servers() -> dict:
     Set EARSHOT_TURN_HOST (e.g. turn:example.com:3478) and EARSHOT_TURN_SECRET
     (matching static-auth-secret in turnserver.conf) to enable TURN."""
     servers: list[dict] = [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]
-    host, secret = os.environ.get("EARSHOT_TURN_HOST"), os.environ.get("EARSHOT_TURN_SECRET")
-    if host and secret:
-        username = str(int(time.time()) + 24 * 3600)
+    host = (os.environ.get("EARSHOT_TURN_HOST") or "").strip()
+    secret = (os.environ.get("EARSHOT_TURN_SECRET") or "").strip()
+    if host and secret not in _TURN_PLACEHOLDERS and not secret.startswith("__"):
+        try:
+            ttl_s = max(60, int(os.environ.get("EARSHOT_TURN_TTL_S", str(_TURN_DEFAULT_TTL_S))))
+        except ValueError:
+            ttl_s = _TURN_DEFAULT_TTL_S
+        username = str(int(time.time()) + ttl_s)
         cred = base64.b64encode(
             hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
         ).decode()

@@ -4,3 +4,6 @@ node_modules/
 client/dist/
 .venv/
 /venv
+.env
+*.env
+!deploy/earshot.env.example
