@@ -58,6 +58,13 @@ export function sessionId(): string {
   return id;
 }
 
+export async function derivePublicId(token: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 32);
+}
+
 /** Real GPS, or ?spoof=lat,lon for desktop testing (dev builds). */
 export function positionSource(): () => Promise<{ lat: number; lon: number }> {
   const spoof = new URLSearchParams(location.search).get("spoof");

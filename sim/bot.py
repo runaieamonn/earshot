@@ -12,6 +12,7 @@ Usage:
 import argparse
 import asyncio
 import fractions
+import hashlib
 import json
 import logging
 import time
@@ -67,7 +68,8 @@ class SineTrack(MediaStreamTrack):
 class Bot:
     def __init__(self, url: str, lat: float, lon: float, name: str, ice_url: str | None):
         self.url, self.lat, self.lon, self.name = url, lat, lon, name
-        self.id = f"bot-{name}-{uuid.uuid4().hex[:8]}"
+        self.token = f"bot-{name}-{uuid.uuid4().hex[:8]}"
+        self.id = hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:32]
         self.ws = None
         self.pcs: dict[str, RTCPeerConnection] = {}
         self.frames_in: dict[str, int] = {}
@@ -103,7 +105,7 @@ class Bot:
     async def run(self) -> None:
         async with websockets.connect(self.url, max_size=32 * 1024) as ws:
             self.ws = ws
-            await self.send({"t": "hello", "id": self.id, "v": 0})
+            await self.send({"t": "hello", "id": getattr(self, "token", self.id), "v": 0})
             hb = asyncio.create_task(self._heartbeat())
             counter = asyncio.create_task(self._report())
             try:

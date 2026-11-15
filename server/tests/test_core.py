@@ -182,3 +182,118 @@ def test_bot_glare_handling_higher_id_accepts():
     bot._send_desc.assert_called_once_with("bot-a", mock_pc)
 
 
+# ---------------- session takeover DoS regression tests ----------------
+
+import hashlib
+import json
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+import server.app as appmod
+from server.app import app, derive_public_id
+
+
+def _reset_coordinator_state():
+    appmod.sessions.clear()
+    appmod._session_tokens.clear()
+    appmod.adjacency.clear()
+    appmod.hushes = HushRegistry()
+
+
+def test_derive_public_id_hides_raw_bearer_token_in_roster():
+    _reset_coordinator_state()
+    alice_token = "alice-secret-bearer-token-11111111"
+    bob_token = "bob-secret-bearer-token-22222222"
+    alice_pub = derive_public_id(alice_token)
+    bob_pub = derive_public_id(bob_token)
+
+    assert len(alice_pub) == 32
+    assert alice_pub == hashlib.sha256(alice_token.encode("utf-8")).hexdigest()[:32]
+    assert alice_pub != alice_token
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws_alice, client.websocket_connect("/ws") as ws_bob:
+        ws_alice.send_text(json.dumps({"t": "hello", "id": alice_token, "v": 0}))
+        ws_alice.send_text(json.dumps({"t": "pos", "lat": 37.7700, "lon": -122.4200}))
+        roster_a1 = json.loads(ws_alice.receive_text())
+        assert roster_a1["t"] == "roster"
+
+        ws_bob.send_text(json.dumps({"t": "hello", "id": bob_token, "v": 0}))
+        ws_bob.send_text(json.dumps({"t": "pos", "lat": 37.7705, "lon": -122.4205}))
+
+        # Bob receives roster containing Alice's derived public ID, never her secret token
+        roster_b = json.loads(ws_bob.receive_text())
+        assert roster_b["t"] == "roster"
+        nbr_ids = [n["id"] for n in roster_b["neighbors"]]
+        assert alice_pub in nbr_ids
+        assert alice_token not in nbr_ids
+        assert bob_pub in appmod.sessions
+        assert alice_pub in appmod.sessions
+
+
+def test_neighbor_session_takeover_dos_blocked():
+    _reset_coordinator_state()
+    alice_token = "alice-secret-bearer-token-aaaa1111"
+    alice_pub = derive_public_id(alice_token)
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws_alice:
+        ws_alice.send_text(json.dumps({"t": "hello", "id": alice_token, "v": 0}))
+        ws_alice.send_text(json.dumps({"t": "pos", "lat": 37.7700, "lon": -122.4200}))
+        first_msg = json.loads(ws_alice.receive_text())
+        assert first_msg["t"] == "roster"
+        assert alice_pub in appmod.sessions
+
+        # Attack 1: Neighbor sees alice_pub in Roster and sends Hello(id=alice_pub) to kick Alice
+        with client.websocket_connect("/ws") as ws_attacker:
+            ws_attacker.send_text(json.dumps({"t": "hello", "id": alice_pub, "v": 0}))
+            err = json.loads(ws_attacker.receive_text())
+            assert err == {"t": "error", "reason": "session_conflict"}
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws_attacker.receive_text()
+            assert exc_info.value.code == 1008
+
+        # Attack 2: Stored token digest mismatch on pub_id (simulated collision/forgery)
+        orig_digest = appmod._session_tokens[alice_pub]
+        appmod._session_tokens[alice_pub] = "0" * 64
+        try:
+            with client.websocket_connect("/ws") as ws_forger:
+                ws_forger.send_text(json.dumps({"t": "hello", "id": alice_token, "v": 0}))
+                err2 = json.loads(ws_forger.receive_text())
+                assert err2 == {"t": "error", "reason": "session_conflict"}
+                with pytest.raises(WebSocketDisconnect) as exc_info2:
+                    ws_forger.receive_text()
+                assert exc_info2.value.code == 1008
+        finally:
+            appmod._session_tokens[alice_pub] = orig_digest
+
+        # Verify Alice's original session is still alive and responsive
+        assert alice_pub in appmod.sessions
+        ws_alice.send_text(json.dumps({"t": "pos", "lat": 37.7701, "lon": -122.4201}))
+
+
+def test_legitimate_same_token_reconnect_and_cleanup():
+    _reset_coordinator_state()
+    alice_token = "alice-secret-bearer-token-reconnect"
+    alice_pub = derive_public_id(alice_token)
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws_old:
+        ws_old.send_text(json.dumps({"t": "hello", "id": alice_token, "v": 0}))
+        ws_old.send_text(json.dumps({"t": "pos", "lat": 37.7700, "lon": -122.4200}))
+        assert json.loads(ws_old.receive_text())["t"] == "roster"
+        old_session = appmod.sessions[alice_pub]
+
+        # Legitimate reconnect presenting the exact same secret bearer token supersedes old socket
+        with client.websocket_connect("/ws") as ws_new:
+            ws_new.send_text(json.dumps({"t": "hello", "id": alice_token, "v": 0}))
+            ws_new.send_text(json.dumps({"t": "pos", "lat": 37.7702, "lon": -122.4202}))
+            assert json.loads(ws_new.receive_text())["t"] == "roster"
+            assert appmod.sessions[alice_pub] is not old_session
+            assert alice_pub in appmod._session_tokens
+
+    # After disconnect, both sessions and _session_tokens are cleaned up
+    assert alice_pub not in appmod.sessions
+    assert alice_pub not in appmod._session_tokens
+
+
+

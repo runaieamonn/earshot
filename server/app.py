@@ -59,10 +59,16 @@ class Session:
 
 app = FastAPI()
 sessions: dict[str, Session] = {}
+_session_tokens: dict[str, str] = {}
 adjacency: dict[str, set[str]] = {}
 hushes = HushRegistry()
 next_recompute_at: float = 0.0
 _lock = asyncio.Lock()
+
+
+def derive_public_id(token: str) -> str:
+    """Derive a 32-hex-char public peer ID from a private client bearer token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
 
 
 async def _send(s: Session, model) -> None:
@@ -123,6 +129,7 @@ async def _reaper() -> None:
 
 async def _drop(s: Session) -> None:
     sessions.pop(s.id, None)
+    _session_tokens.pop(s.id, None)
     for other in adjacency.get(s.id, set()).copy():
         adjacency.get(other, set()).discard(s.id)
         if other in sessions:
@@ -194,10 +201,26 @@ async def ws_endpoint(ws: WebSocket) -> None:
             if isinstance(msg, Hello):
                 if me is not None:
                     continue
-                if msg.id in sessions:  # takeover: old socket is superseded
-                    await _drop(sessions[msg.id])
-                me = Session(id=msg.id, ws=ws, ip=ip)
+                token_digest = hashlib.sha256(msg.id.encode("utf-8")).hexdigest()
+                pub_id = token_digest[:32]
+                # Reject any attempt to impersonate an active public peer ID directly
+                if msg.id in sessions and not hmac.compare_digest(
+                    _session_tokens.get(msg.id, ""), token_digest
+                ):
+                    await ws.send_text(Error(reason="session_conflict").model_dump_json())
+                    await ws.close(code=1008)
+                    return
+                if pub_id in sessions:
+                    prev_digest = _session_tokens.get(pub_id, "")
+                    if not prev_digest or not hmac.compare_digest(prev_digest, token_digest):
+                        await ws.send_text(Error(reason="session_conflict").model_dump_json())
+                        await ws.close(code=1008)
+                        return
+                    # Legitimate same-token reconnect: supersede stale socket
+                    await _drop(sessions[pub_id])
+                me = Session(id=pub_id, ws=ws, ip=ip)
                 sessions[me.id] = me
+                _session_tokens[me.id] = token_digest
                 continue
             if me is None:
                 await ws.send_text(Error(reason="hello first").model_dump_json())

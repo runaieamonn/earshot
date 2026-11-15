@@ -1,5 +1,5 @@
 import "./style.css";
-import { Coordinator, positionSource, sessionId, type ServerMsg } from "./ws/client";
+import { Coordinator, derivePublicId, positionSource, sessionId, type ServerMsg } from "./ws/client";
 import { state, notify, subscribe } from "./state/store";
 import { locationModal, headphonesModal } from "./ui/modals";
 import { mountSoundstage } from "./ui/soundstage";
@@ -17,10 +17,11 @@ async function iceServers(): Promise<RTCIceServer[]> {
 }
 
 async function start(engine: AudioEngine): Promise<void> {
-  const myId = sessionId();
+  const myToken = sessionId();
+  const myId = await derivePublicId(myToken);
   const co = new Coordinator(
     `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
-    myId,
+    myToken,
     positionSource(),
   );
 
